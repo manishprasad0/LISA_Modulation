@@ -1,0 +1,62 @@
+# Source-parameter configuration (see SUMMARY.md).
+#
+# Every physical waveform parameter is listed under `parameters`, each with
+# a prior (sampled uniformly, possibly in a transformed space -- see
+# `transform` below) and a `fixed_value` used whenever that parameter is
+# NOT in `active_params`. To change which parameters the network trains on,
+# just edit `active_params` -- no code changes needed.
+#
+# `fixed_value` and the prior bounds are both given in the parameter's
+# natural physical units (solar masses, radians, Gpc) -- log10/sin/cos are
+# only applied when turning a uniform prior draw into that physical value,
+# not to `fixed_value` itself.
+#
+# f_ref is not physically meaningful to vary -- bbhx sets it internally
+# when 0 -- so it's always fixed to 0.0, kept out of `parameters` entirely.
+f_ref: 0.0
+t_ref_offset_days: 5  # merger this many days before the end of the observation
+
+# Stage 1a (current): only sky position + orientation are trained on.
+active_params: [lam, beta, inc, psi]
+
+parameters:
+  m1:                        # bbhx requires m1 > m2 -- not enforced if both go active
+    transform: log10         # prior given in log10(m1 / Msun)
+    prior: [5.0, 6.0]
+    fixed_value: 2.0e+5
+  m2:
+    transform: log10
+    prior: [5.0, 6.0]
+    fixed_value: 1.0e+5
+  chi1z:
+    transform: identity
+    prior: [-1.0, 1.0]
+    fixed_value: 0.0
+  chi2z:
+    transform: identity
+    prior: [-1.0, 1.0]
+    fixed_value: 0.7
+  dist:                       # values here are in Gpc; converted to SI for bbhx
+    transform: identity
+    prior: [1.0, 50.0]
+    fixed_value: 20.0
+  phi_ref:
+    transform: identity
+    prior: ["0", "2*pi"]
+    fixed_value: 1.0
+  lam:
+    transform: identity
+    prior: ["0", "2*pi"]
+    fixed_value: 0.0
+  beta:
+    transform: sin            # prior given on sin(beta), for uniform sampling over the sphere
+    prior: [-1.0, 1.0]
+    fixed_value: 0.0
+  inc:
+    transform: cos            # prior given on cos(inc), for uniform sampling over the sphere
+    prior: [-1.0, 1.0]
+    fixed_value: "pi/2"
+  psi:
+    transform: identity
+    prior: ["0", "pi"]
+    fixed_value: 0.0
