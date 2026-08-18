@@ -9,6 +9,9 @@ and it keeps the door open for running this on GPU on the cluster.
 See SUMMARY.md for the full project context.
 """
 
+import os
+from concurrent.futures import ProcessPoolExecutor
+
 import numpy as np
 import torch
 from lisatools.utils.constants import YRSID_SI
@@ -70,8 +73,12 @@ def generate_waveforms_frequency_domain(free_params):
 
 
 def waveforms_to_time_domain(wave_freq_domain, device="cpu"):
-    wave_freq_domain = torch.from_numpy(wave_freq_domain).to(device)
-    return torch.fft.irfft(wave_freq_domain, n=N, dim=-1)
+    wave_freq_domain = torch.from_numpy(wave_freq_domain)
+    if device == "mps":
+        # MPS has no float64/complex128 support at all -- bbhx's native
+        # dtype has to be downcast before it can even be moved there.
+        wave_freq_domain = wave_freq_domain.to(torch.complex64)
+    return torch.fft.irfft(wave_freq_domain.to(device), n=N, dim=-1)
 
 
 def compute_bumps(wave_time_domain):
@@ -85,7 +92,10 @@ def compute_bumps(wave_time_domain):
     Returns bumps with shape (n_batch, 3, n_time_bins).
     """
     n_batch, n_channels, n_time = wave_time_domain.shape
-    window = STFT_WINDOW.to(wave_time_domain.device)
+    # dtype must match too, not just device: on MPS the signal is float32
+    # (there's no float64 support to fall back to), so a bare .to(device)
+    # would leave the window float64 and torch.stft would error.
+    window = STFT_WINDOW.to(dtype=wave_time_domain.dtype, device=wave_time_domain.device)
 
     zxx = torch.stft(
         wave_time_domain.reshape(-1, n_time),
@@ -121,6 +131,51 @@ def generate_dataset(n_samples, batch_size=8, rng=None, device="cpu"):
         bumps_batches.append(bumps.cpu().numpy())
 
     bumps = np.concatenate(bumps_batches, axis=0)
+    return bumps, free_params
+
+
+def _generate_chunk(args):
+    n_samples, batch_size, seed = args
+    torch.set_num_threads(1)
+    rng = np.random.default_rng(seed)
+    return generate_dataset(n_samples, batch_size=batch_size, rng=rng)
+
+
+def generate_dataset_multiprocess(n_samples, n_workers=6, batch_size=4, rng=None):
+    """Same as generate_dataset, but splits the work across n_workers OS
+    processes (CPU-only, this laptop's bbhx backend).
+
+    Benchmarked on this machine (Apple M5, 4 performance + 6 efficiency
+    cores): 6 worker processes gave the best throughput (~1.4s/sample vs.
+    ~1.9s/sample for a single default-threaded process, roughly a 25%
+    speedup). 8-10 workers were *worse* than a single process -- each
+    sample's full-year time-domain array is large enough (~150MB) that
+    this workload is memory-bandwidth-bound, not compute-bound, so piling
+    on more processes past ~6 just adds contention. Each worker is capped
+    to 1 thread so its own torch/BLAS calls don't oversubscribe on top of
+    the process-level parallelism.
+
+    This is a CPU-specific workaround, not something to carry over once
+    running on the cluster's GPU bbhx backend -- there, use device="cuda"
+    on generate_dataset directly instead.
+    """
+    os.environ.setdefault("OMP_NUM_THREADS", "1")
+    os.environ.setdefault("MKL_NUM_THREADS", "1")
+    os.environ.setdefault("VECLIB_MAXIMUM_THREADS", "1")
+    os.environ.setdefault("NUMEXPR_NUM_THREADS", "1")
+
+    rng = np.random.default_rng() if rng is None else rng
+    counts = [n_samples // n_workers + (1 if i < n_samples % n_workers else 0) for i in range(n_workers)]
+    seeds = rng.integers(0, 2**31 - 1, size=n_workers)
+    chunk_args = [(n, min(n, batch_size), int(s)) for n, s in zip(counts, seeds) if n > 0]
+
+    with ProcessPoolExecutor(max_workers=n_workers) as ex:
+        chunks = list(ex.map(_generate_chunk, chunk_args))
+
+    bumps = np.concatenate([c[0] for c in chunks], axis=0)
+    free_params = {
+        name: np.concatenate([c[1][name] for c in chunks]) for name in chunks[0][1]
+    }
     return bumps, free_params
 
 
