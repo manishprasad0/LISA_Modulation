@@ -10,6 +10,9 @@ See SUMMARY.md for the full project context.
 """
 
 import os
+import shutil
+import tempfile
+import time
 from concurrent.futures import ProcessPoolExecutor
 
 import numpy as np
@@ -134,30 +137,52 @@ def generate_dataset(n_samples, batch_size=8, rng=None, device="cpu"):
     return bumps, free_params
 
 
-def _generate_chunk(args):
-    n_samples, batch_size, seed = args
+def _generate_and_save_chunk(args):
+    n_samples, seed, path = args
     torch.set_num_threads(1)
     rng = np.random.default_rng(seed)
-    return generate_dataset(n_samples, batch_size=batch_size, rng=rng)
+    free_params = sample_free_parameters(n_samples, rng=rng)
+    wave_freq_domain = generate_waveforms_frequency_domain(free_params)
+    np.save(path, wave_freq_domain)
+    return free_params
 
 
-def generate_dataset_multiprocess(n_samples, n_workers=6, batch_size=4, rng=None):
-    """Same as generate_dataset, but splits the work across n_workers OS
-    processes (CPU-only, this laptop's bbhx backend).
+def _save_partial(output_path, bumps_chunks, free_params_chunks):
+    bumps = np.concatenate(bumps_chunks, axis=0)
+    free_params = {name: np.concatenate(values) for name, values in free_params_chunks.items()}
+    save_dataset(output_path, bumps, free_params)
+    return bumps, free_params
 
-    Benchmarked on this machine (Apple M5, 4 performance + 6 efficiency
-    cores): 6 worker processes gave the best throughput (~1.4s/sample vs.
-    ~1.9s/sample for a single default-threaded process, roughly a 25%
-    speedup). 8-10 workers were *worse* than a single process -- each
-    sample's full-year time-domain array is large enough (~150MB) that
-    this workload is memory-bandwidth-bound, not compute-bound, so piling
-    on more processes past ~6 just adds contention. Each worker is capped
-    to 1 thread so its own torch/BLAS calls don't oversubscribe on top of
-    the process-level parallelism.
 
-    This is a CPU-specific workaround, not something to carry over once
-    running on the cluster's GPU bbhx backend -- there, use device="cuda"
-    on generate_dataset directly instead.
+def generate_dataset_fast(
+    n_samples, output_path, n_workers=6, samples_per_worker=4, device="mps",
+    rng=None, checkpoint_every=50,
+):
+    """Fastest dataset-generation path found by benchmarking (see the
+    conversation this was designed in / SUMMARY.md): decouples bbhx's
+    CPU-bound waveform generation from irfft/STFT post-processing, so each
+    can run at its own best setting instead of fighting each other.
+
+    Each round of n_workers * samples_per_worker samples:
+      1. n_workers processes generate that round's waveforms in parallel
+         (pure CPU, thread-capped to 1 each) and save them to a scratch dir.
+      2. Those raw waveforms are loaded back and run through irfft+STFT on
+         `device` (MPS on this MacBook) in one continuous pass, then deleted.
+
+    Benchmarked on this machine (M5, 4 performance + 6 efficiency cores) at
+    ~0.49s/sample, vs. ~1.7-2.0s/sample single-process CPU-only -- roughly
+    3.5x faster. Splitting into rounds isn't just a knob to tune: a raw
+    waveform is ~150MB/sample, so keeping all of n_samples on disk at once
+    (e.g. ~15TB for 10^5 samples) isn't possible -- this interleaving keeps
+    peak scratch-disk usage to one round's worth.
+
+    This is a single continuous run, not a resumable one: the whole
+    n_samples sequence is drawn from one evolving `rng` (freshly seeded if
+    not given), so interrupting it and re-running for the remainder does
+    NOT pick up where it left off or reproduce a matching prefix.
+    checkpoint_every periodically overwrites output_path with everything
+    generated so far, purely so a crash doesn't lose the full run -- not a
+    resume mechanism.
     """
     os.environ.setdefault("OMP_NUM_THREADS", "1")
     os.environ.setdefault("MKL_NUM_THREADS", "1")
@@ -165,18 +190,55 @@ def generate_dataset_multiprocess(n_samples, n_workers=6, batch_size=4, rng=None
     os.environ.setdefault("NUMEXPR_NUM_THREADS", "1")
 
     rng = np.random.default_rng() if rng is None else rng
-    counts = [n_samples // n_workers + (1 if i < n_samples % n_workers else 0) for i in range(n_workers)]
-    seeds = rng.integers(0, 2**31 - 1, size=n_workers)
-    chunk_args = [(n, min(n, batch_size), int(s)) for n, s in zip(counts, seeds) if n > 0]
+    round_size = n_workers * samples_per_worker
+    n_rounds = -(-n_samples // round_size)  # ceil division
 
-    with ProcessPoolExecutor(max_workers=n_workers) as ex:
-        chunks = list(ex.map(_generate_chunk, chunk_args))
+    scratch_dir = tempfile.mkdtemp(prefix="lisa_waveform_scratch_")
+    bumps_chunks = []
+    free_params_chunks = {}
+    samples_done = 0
+    t0 = time.time()
 
-    bumps = np.concatenate([c[0] for c in chunks], axis=0)
-    free_params = {
-        name: np.concatenate([c[1][name] for c in chunks]) for name in chunks[0][1]
-    }
-    return bumps, free_params
+    try:
+        with ProcessPoolExecutor(max_workers=n_workers) as ex:
+            for round_idx in range(n_rounds):
+                n_this_round = min(round_size, n_samples - samples_done)
+                counts = [
+                    n_this_round // n_workers + (1 if i < n_this_round % n_workers else 0)
+                    for i in range(n_workers)
+                ]
+                seeds = rng.integers(0, 2**31 - 1, size=n_workers)
+                paths = [os.path.join(scratch_dir, f"chunk_{i}.npy") for i in range(n_workers)]
+                chunk_args = [(n, int(s), p) for n, s, p in zip(counts, seeds, paths) if n > 0]
+
+                worker_free_params = list(ex.map(_generate_and_save_chunk, chunk_args))
+
+                for (_, _, path), free_params in zip(chunk_args, worker_free_params):
+                    wave_freq_domain = np.load(path)
+                    wave_time_domain = waveforms_to_time_domain(wave_freq_domain, device=device)
+                    bumps = compute_bumps(wave_time_domain).cpu().numpy()
+                    os.remove(path)
+
+                    bumps_chunks.append(bumps)
+                    for name, values in free_params.items():
+                        free_params_chunks.setdefault(name, []).append(values)
+
+                samples_done += n_this_round
+                elapsed = time.time() - t0
+                rate = samples_done / elapsed
+                eta_hours = (n_samples - samples_done) / rate / 3600 if rate > 0 else float("nan")
+                print(
+                    f"round {round_idx + 1}/{n_rounds}: {samples_done}/{n_samples} samples "
+                    f"({elapsed:.0f}s elapsed, {rate:.3f} samples/s, ETA {eta_hours:.2f}h)",
+                    flush=True,
+                )
+
+                if checkpoint_every and (round_idx + 1) % checkpoint_every == 0:
+                    _save_partial(output_path, bumps_chunks, free_params_chunks)
+    finally:
+        shutil.rmtree(scratch_dir, ignore_errors=True)
+
+    return _save_partial(output_path, bumps_chunks, free_params_chunks)
 
 
 def save_dataset(path, bumps, free_params):
@@ -184,6 +246,7 @@ def save_dataset(path, bumps, free_params):
 
 
 if __name__ == "__main__":
-    bumps, free_params = generate_dataset(n_samples=16, batch_size=4)
-    save_dataset("dataset.npz", bumps, free_params)
+    # Quick sanity check of the fast path, not the real 10^5-sample run --
+    # call generate_dataset_fast(100_000, "dataset.npz") directly for that.
+    bumps, free_params = generate_dataset_fast(n_samples=24, output_path="dataset.npz")
     print(f"saved {bumps.shape[0]} samples, bumps shape {bumps.shape} -> dataset.npz")
