@@ -66,6 +66,40 @@ There is no test suite, lint config, or build step in this repo.
     comparably-deep dips, where `summarize_sweep_global_min` would report a spurious shift purely
     from the depth ranking between two stationary dips flipping.
 
+## MPI-IS cluster setup (GPU / CUDA)
+
+A working `bbhx` GPU environment is set up on the MPI-IS cluster (see `~/Documents/Cluster/README.md`
+on the local machine for general cluster usage) at `/fast/mprasad/lisa_modulation_test` (`uv`-managed,
+`pyproject.toml` + `uv.lock`). Key points if it needs to be rebuilt or extended:
+
+- The cluster's GPU nodes are A100-SXM4-40GB with driver 580.82.07 (CUDA 13.0 capability) — fully
+  backward compatible with CUDA 12.x. `bbhx-cuda12x` + `cupy-cuda12x` are installed, matching the
+  `module load cuda/12.4` used in the HTCondor wrapper script.
+- Getting GPU-backed `BBHWaveformFD` working also requires `lisaanalysistools-cuda12x` (a separate
+  PyPI package, not just `lisaanalysistools`) for orbit computation on the GPU. Any `Orbits` object
+  passed to `BBHWaveformFD`'s `response_kwargs` must be constructed with the same
+  `force_backend=` as the waveform generator itself, or `LISATDIResponse.orbits` raises an
+  `AssertionError` (`bbhx/response/fastfdresponse.py`, the `orbits` setter).
+- `~/cluster/htcondor/cuda_wrapper.sh` (personalized, on the cluster) prepends
+  `/fast/mprasad/lisa_modulation_test/.venv/bin` to `PATH` so jobs use this project's venv.
+- The submit/execute nodes are on a shared Lustre filesystem, but there can be a real propagation
+  delay between a file write on the login node (e.g. via `scp`) and it being visible/complete on a
+  compute node — a job can transiently see a partially-copied file. Don't assume a file is safe to
+  use for a job immediately after writing/copying it; a few seconds' buffer avoids flaky failures.
+
+## Known environment issue: cluster CPU-backend crash (AVX-512, `lisaanalysistools==1.2.8`)
+
+`lisaanalysistools`'s compiled CPU orbit backend (`lisatools_backend_cpu.pycppdetector`, imported
+by `lisatools.detector` and pulled in unconditionally by `bbhx.response.fastfdresponse`, so it
+loads on *any* `BBHWaveformFD` use, GPU included) is built with AVX-512BW/VL instructions
+(`vmovdqu8`/`vmovdqu16`) in the `1.2.8` PyPI Linux x86_64 wheel. This SIGILLs (`Illegal instruction`,
+exit 132, no Python traceback) on any CPU without AVX-512 — including the cluster's AMD EPYC 7662
+(Zen 2) nodes. Versions `1.2.3`–`1.2.4`, `1.2.6`, `1.2.7` do not have this problem (checked via
+`objdump -d ... | grep vmovdqu8`); `1.2.5` has no Linux x86_64 wheel at all. Pin
+`lisaanalysistools==1.2.7` (and, if using the CUDA backend, `lisaanalysistools-cuda12x==1.2.7`,
+which does not have the AVX-512 issue in either 1.2.7 or 1.2.8) rather than taking the latest.
+Not yet reported upstream.
+
 ## Known environment issue: macOS CPU-backend crash
 
 On macOS arm64, `BBHWaveformFD(force_backend="cpu")` (and anything that triggers the CPU backend
