@@ -69,8 +69,13 @@ There is no test suite, lint config, or build step in this repo.
 ## MPI-IS cluster setup (GPU / CUDA)
 
 A working `bbhx` GPU environment is set up on the MPI-IS cluster (see `~/Documents/Cluster/README.md`
-on the local machine for general cluster usage) at `/fast/mprasad/lisa_modulation_test` (`uv`-managed,
-`pyproject.toml` + `uv.lock`). Key points if it needs to be rebuilt or extended:
+on the local machine for general cluster usage) at `/fast/mprasad/lisa_modulation_test`
+(`uv`-managed, `pyproject.toml` + `uv.lock`) — re-confirmed directly on the cluster (`pwd -P` inside
+the project dir resolves to `/lustre/fast/fast/mprasad/lisa_modulation_test`; `/home/mprasad` has no
+`lisa_modulation_test` dir at all). An earlier note here claimed it lived under home instead of
+`/fast`; that was wrong (or the project was moved back since) — always re-verify with `ssh mpi "ls
+/fast/mprasad/lisa_modulation_test"` before trusting a path from documentation rather than assuming
+either location. Key points if it needs to be rebuilt or extended:
 
 - The cluster's GPU nodes are A100-SXM4-40GB with driver 580.82.07 (CUDA 13.0 capability) — fully
   backward compatible with CUDA 12.x. `bbhx-cuda12x` + `cupy-cuda12x` are installed, matching the
@@ -80,8 +85,9 @@ on the local machine for general cluster usage) at `/fast/mprasad/lisa_modulatio
   passed to `BBHWaveformFD`'s `response_kwargs` must be constructed with the same
   `force_backend=` as the waveform generator itself, or `LISATDIResponse.orbits` raises an
   `AssertionError` (`bbhx/response/fastfdresponse.py`, the `orbits` setter).
-- `~/cluster/htcondor/cuda_wrapper.sh` (personalized, on the cluster) prepends
-  `/fast/mprasad/lisa_modulation_test/.venv/bin` to `PATH` so jobs use this project's venv.
+- `~/cluster/htcondor/cuda_wrapper.sh` (personalized, on the cluster) prepends this project's
+  `.venv/bin` to `PATH` so jobs use it — points at `/fast/mprasad/lisa_modulation_test/.venv/bin`,
+  matching the project's actual location (see above); re-checked directly on the cluster.
 - The submit/execute nodes are on a shared Lustre filesystem, but there can be a real propagation
   delay between a file write on the login node (e.g. via `scp`) and it being visible/complete on a
   compute node — a job can transiently see a partially-copied file. Don't assume a file is safe to

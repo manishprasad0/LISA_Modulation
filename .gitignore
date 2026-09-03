@@ -8,3 +8,7 @@ wheels/
 
 # Virtual environments
 .venv
+
+# HTCondor job logs / generated datasets
+outputs/
+*.npz

@@ -1,0 +1,39 @@
+# HTCondor submission file for the simulator_gpu.py smoke test (5 samples,
+# see ../test_run_gpu.py). Background: CLAUDE.md's "MPI-IS cluster setup"
+# section, and /Users/mprasad/Documents/Cluster/README.md on the local
+# machine for general HTCondor usage on this cluster.
+#
+# Submit with (bid 50 is this cluster's rule-of-thumb default):
+#   condor_submit_bid 50 htcondor/test_run_gpu.sub
+# or just run htcondor/submit_test_run_gpu.sh, which also creates outputs/.
+
+# Personalized wrapper already set up on the cluster (CLAUDE.md): sources
+# the module system, `module load cuda/12.4`, prepends
+# /fast/mprasad/lisa_modulation_test/.venv/bin to PATH, then execs whatever
+# is passed via `arguments`.
+executable = /home/mprasad/cluster/htcondor/cuda_wrapper.sh
+
+arguments = /fast/mprasad/lisa_modulation_test/.venv/bin/python test_run_gpu.py
+
+# Project lives at /fast/mprasad/lisa_modulation_test (re-verified directly
+# on the cluster -- see CLAUDE.md). Relative paths in test_run_gpu.py
+# (outputs/test_run_gpu_dataset.npz) resolve against this.
+initialdir = /fast/mprasad/lisa_modulation_test
+
+error  = outputs/$(Cluster).err
+output = outputs/$(Cluster).out
+log    = outputs/$(Cluster).log
+
+# Modest on purpose -- this is a 5-sample smoke test, not the real dataset
+# generation run. Revisit request_memory once batch_size is actually tuned
+# (see simulator_gpu.generate_dataset's docstring).
+request_memory = 32000
+request_cpus = 4
+request_gpus = 1
+
+# A100-SXM4-40GB nodes, per CLAUDE.md. Matches the threshold already proven
+# to match these nodes in bbhx_test.sub (a flat "> 40000" risks excluding a
+# node reporting e.g. 40536MiB - 40000 as "not > 40000" depending on rounding).
+requirements = TARGET.CUDAGlobalMemoryMb > 20000
+
+queue
